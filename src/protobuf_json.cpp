@@ -5,6 +5,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cstdint>
+#include <vector>
 
 #include "protodec.h"
 
@@ -14,52 +15,48 @@ namespace sqlite_protobuf
 
     namespace
     {
-        // Helper to parse varints from raw buffers
-        const uint8_t* read_varint(const uint8_t *p, const uint8_t *end, uint64_t *val) {
-            uint64_t result = 0;
-            int shift = 0;
-            while (p < end) {
-                uint64_t b = *p++;
-                result |= (b & 0x7F) << shift;
-                if (!(b & 0x80)) {
-                    *val = result;
-                    return p;
-                }
-                shift += 7;
-                if (shift >= 64) break;
-            }
-            return nullptr;
+        // Helper to convert raw 16-byte Manager.io GUID bytes into a standard string
+        std::string bytes_to_guid_str(const uint8_t *b) {
+            char buf[37];
+            snprintf(buf, sizeof(buf),
+                "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                b[3], b[2], b[1], b[0],
+                b[5], b[4],
+                b[7], b[6],
+                b[8], b[9],
+                b[10], b[11], b[12], b[13], b[14], b[15]
+            );
+            return std::string(buf);
         }
 
-        // Helper to check and convert an 18-byte Manager.io GUID sub-block into a string
-        bool try_parse_guid_bytes(const uint8_t *data, size_t size, std::string &out_guid) {
-            if (size == 18 && data[0] == 0x09 && data[10] == 0x11) {
-                const uint8_t *p1 = &data[1];
-                const uint8_t *p2 = &data[11];
-                uint8_t b[16];
+        // Helper to scan a raw buffer for Manager.io GUID signatures [0x09][8 bytes][0x11][8 bytes]
+        // and extract all found GUIDs.
+        std::vector<std::string> extract_manager_guids(const uint8_t *data, size_t size) {
+            std::vector<std::string> guids;
+            if (size < 18) return guids;
 
-                // Little-endian swap for the first 8 bytes
-                for (int i = 0; i < 8; ++i) {
-                    b[7 - i] = p1[i];
-                }
-                // Copy the last 8 bytes as-is
-                for (int i = 0; i < 8; ++i) {
-                    b[8 + i] = p2[i];
-                }
+            for (size_t i = 0; i <= size - 18; ++i) {
+                // Check for the characteristic Manager.io GUID footprint:
+                // 0x09 (tag 1, wire type 1) followed by 8 bytes, then 0x11 (tag 2, wire type 1) followed by 8 bytes
+                if (data[i] == 0x09 && data[i + 10] == 0x11) {
+                    const uint8_t *p1 = &data[i + 1];  // First 8 bytes
+                    const uint8_t *p2 = &data[i + 11]; // Last 8 bytes
+                    uint8_t b[16];
 
-                char buf[37];
-                snprintf(buf, sizeof(buf),
-                    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                    b[3], b[2], b[1], b[0],
-                    b[5], b[4],
-                    b[7], b[6],
-                    b[8], b[9],
-                    b[10], b[11], b[12], b[13], b[14], b[15]
-                );
-                out_guid = std::string(buf);
-                return true;
+                    // Little-endian swap for the first 8 bytes
+                    for (int j = 0; j < 8; ++j) {
+                        b[7 - j] = p1[j];
+                    }
+                    // Copy the last 8 bytes as-is
+                    for (int j = 0; j < 8; ++j) {
+                        b[8 + j] = p2[j];
+                    }
+
+                    guids.push_back(bytes_to_guid_str(b));
+                    i += 17; // Skip past this matched block
+                }
             }
-            return false;
+            return guids;
         }
 
         void protobuf_to_json(sqlite3_context *context, int argc, sqlite3_value **argv)
@@ -76,26 +73,33 @@ namespace sqlite_protobuf
             const uint8_t *raw_bytes = static_cast<const uint8_t *>(sqlite3_value_blob(data));
             size_t raw_len = static_cast<size_t>(sqlite3_value_bytes(data));
 
-            // Optional quick scan: if the whole blob itself is just a standalone GUID block
-            std::string standalone_guid;
-            if (try_parse_guid_bytes(raw_bytes, raw_len, standalone_guid)) {
-                std::string json = "\"" + standalone_guid + "\"";
-                sqlite3_result_text(context, json.c_str(), json.length(), SQLITE_TRANSIENT);
+            if (!raw_bytes || raw_len == 0) {
+                sqlite3_result_null(context);
                 return;
             }
 
-            // Standard decode for compound entity records
+            // 1. Run standard protobuf decode
             Buffer buffer;
             buffer.start = raw_bytes;
             buffer.end = buffer.start + raw_len;
             Field field = decodeProtobuf(buffer, mode > 1);
 
-            // Convert to json
+            // 2. Generate standard JSON
             std::ostringstream os;
             toJson(&field, os, mode > 0);
             std::string json = os.str();
 
-            // Return result
+            // 3. Scan raw bytes for embedded Manager.io GUIDs
+            std::vector<std::string> found_guids = extract_manager_guids(raw_bytes, raw_len);
+
+            // If a standalone 18-byte GUID block was passed directly, output it cleanly as a quoted string
+            if (raw_len == 18 && !found_guids.empty()) {
+                std::string guid_json = "\"" + found_guids[0] + "\"";
+                sqlite3_result_text(context, guid_json.c_str(), guid_json.length(), SQLITE_TRANSIENT);
+                return;
+            }
+
+            // Return the standard decoded JSON string (you can inspect or further map found_guids here if needed)
             sqlite3_result_text(context, json.c_str(), json.length(), SQLITE_TRANSIENT);
         }
 
