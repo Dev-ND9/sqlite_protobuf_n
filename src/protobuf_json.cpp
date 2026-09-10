@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <cstdint>
 #include <vector>
+#include <regex>
 
 #include "protodec.h"
 
@@ -30,30 +31,25 @@ namespace sqlite_protobuf
         }
 
         // Helper to scan a raw buffer for Manager.io GUID signatures [0x09][8 bytes][0x11][8 bytes]
-        // and extract all found GUIDs.
         std::vector<std::string> extract_manager_guids(const uint8_t *data, size_t size) {
             std::vector<std::string> guids;
             if (size < 18) return guids;
 
             for (size_t i = 0; i <= size - 18; ++i) {
-                // Check for the characteristic Manager.io GUID footprint:
-                // 0x09 (tag 1, wire type 1) followed by 8 bytes, then 0x11 (tag 2, wire type 1) followed by 8 bytes
                 if (data[i] == 0x09 && data[i + 10] == 0x11) {
-                    const uint8_t *p1 = &data[i + 1];  // First 8 bytes
-                    const uint8_t *p2 = &data[i + 11]; // Last 8 bytes
+                    const uint8_t *p1 = &data[i + 1];  
+                    const uint8_t *p2 = &data[i + 11]; 
                     uint8_t b[16];
 
-                    // Little-endian swap for the first 8 bytes
                     for (int j = 0; j < 8; ++j) {
                         b[7 - j] = p1[j];
                     }
-                    // Copy the last 8 bytes as-is
                     for (int j = 0; j < 8; ++j) {
                         b[8 + j] = p2[j];
                     }
 
                     guids.push_back(bytes_to_guid_str(b));
-                    i += 17; // Skip past this matched block
+                    i += 17; 
                 }
             }
             return guids;
@@ -78,28 +74,44 @@ namespace sqlite_protobuf
                 return;
             }
 
-            // 1. Run standard protobuf decode
+            // Extract GUIDs from raw bytes first
+            std::vector<std::string> found_guids = extract_manager_guids(raw_bytes, raw_len);
+
+            // If the whole blob is just a standalone GUID block
+            if (raw_len == 18 && !found_guids.empty()) {
+                std::string json = "\"" + found_guids[0] + "\"";
+                sqlite3_result_text(context, json.c_str(), json.length(), SQLITE_TRANSIENT);
+                return;
+            }
+
+            // Standard protobuf decode
             Buffer buffer;
             buffer.start = raw_bytes;
             buffer.end = buffer.start + raw_len;
             Field field = decodeProtobuf(buffer, mode > 1);
 
-            // 2. Generate standard JSON
+            // Generate standard JSON
             std::ostringstream os;
             toJson(&field, os, mode > 0);
             std::string json = os.str();
 
-            // 3. Scan raw bytes for embedded Manager.io GUIDs
-            std::vector<std::string> found_guids = extract_manager_guids(raw_bytes, raw_len);
-
-            // If a standalone 18-byte GUID block was passed directly, output it cleanly as a quoted string
-            if (raw_len == 18 && !found_guids.empty()) {
-                std::string guid_json = "\"" + found_guids[0] + "\"";
-                sqlite3_result_text(context, guid_json.c_str(), guid_json.length(), SQLITE_TRANSIENT);
-                return;
+            // If we found Manager GUIDs, substitute their messy object representations in the JSON string
+            // Manager.io protobuf encodes these as nested fields {"1":<num>,"2":<num>} or similar structures.
+            // We can cleanly replace matching patterns or inject them. 
+            // For a robust fallback, if there's a pattern of fields containing the GUID parts, we patch them.
+            // Alternatively, if protodec outputs them as nested objects, let's substitute them sequentially:
+            for (const auto& guid : found_guids) {
+                // Look for typical protobuf subfield object structures representing the split 64-bit chunks
+                // and replace them directly with the clean GUID string value.
+                // Regex pattern to catch nested objects containing fields 1 and 2 with large numbers/scientific notation
+                std::string replacement = "\"" + guid + "\"";
+                
+                // Simple heuristic replacement of the subfield object block if found in JSON
+                // e.g., {"1":<num>,"2":<num>} or {"2":<num>,"1":<num>}
+                json = std::regex_replace(json, std::regex(R"(\{\s*"1"\s*:\s*[^,\}]+\s*,\s*"2"\s*:\s*[^,\}]+\s*\})"), replacement);
+                json = std::regex_replace(json, std::regex(R"(\{\s*"2"\s*:\s*[^,\}]+\s*,\s*"1"\s*:\s*[^,\}]+\s*\})"), replacement);
             }
 
-            // Return the standard decoded JSON string (you can inspect or further map found_guids here if needed)
             sqlite3_result_text(context, json.c_str(), json.length(), SQLITE_TRANSIENT);
         }
 
