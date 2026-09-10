@@ -30,8 +30,8 @@ namespace sqlite_protobuf
             return std::string(buf);
         }
 
-        // Helper to scan a raw buffer for Manager.io GUID signatures [0x09][8 bytes][0x11][8 bytes]
-        std::vector<std::string> extract_manager_guids(const uint8_t *data, size_t size) {
+        // Scan raw buffer and extract all Manager.io GUIDs in order of appearance
+        std::vector<std::string> extract_all_manager_guids(const uint8_t *data, size_t size) {
             std::vector<std::string> guids;
             if (size < 18) return guids;
 
@@ -55,6 +55,7 @@ namespace sqlite_protobuf
             return guids;
         }
 
+        // Converts protobuf blob to JSON, preserving field numbers while fixing GUID formatting
         void protobuf_to_json(sqlite3_context *context, int argc, sqlite3_value **argv)
         {
             if(argc < 1 || argc > 2)
@@ -74,42 +75,48 @@ namespace sqlite_protobuf
                 return;
             }
 
-            // Extract GUIDs from raw bytes first
-            std::vector<std::string> found_guids = extract_manager_guids(raw_bytes, raw_len);
+            // 1. Extract raw GUIDs in exact sequence
+            std::vector<std::string> found_guids = extract_all_manager_guids(raw_bytes, raw_len);
 
-            // If the whole blob is just a standalone GUID block
+            // If the whole blob is just a standalone 18-byte GUID block
             if (raw_len == 18 && !found_guids.empty()) {
                 std::string json = "\"" + found_guids[0] + "\"";
                 sqlite3_result_text(context, json.c_str(), json.length(), SQLITE_TRANSIENT);
                 return;
             }
 
-            // Standard protobuf decode
+            // 2. Run standard protobuf decode
             Buffer buffer;
             buffer.start = raw_bytes;
             buffer.end = buffer.start + raw_len;
             Field field = decodeProtobuf(buffer, mode > 1);
 
-            // Generate standard JSON
+            // 3. Generate standard JSON (retaining all original field numbers)
             std::ostringstream os;
             toJson(&field, os, mode > 0);
             std::string json = os.str();
 
-            // If we found Manager GUIDs, substitute their messy object representations in the JSON string
-            // Manager.io protobuf encodes these as nested fields {"1":<num>,"2":<num>} or similar structures.
-            // We can cleanly replace matching patterns or inject them. 
-            // For a robust fallback, if there's a pattern of fields containing the GUID parts, we patch them.
-            // Alternatively, if protodec outputs them as nested objects, let's substitute them sequentially:
-            for (const auto& guid : found_guids) {
-                // Look for typical protobuf subfield object structures representing the split 64-bit chunks
-                // and replace them directly with the clean GUID string value.
-                // Regex pattern to catch nested objects containing fields 1 and 2 with large numbers/scientific notation
-                std::string replacement = "\"" + guid + "\"";
+            // 4. Sequentially patch the JSON object blocks representing the GUIDs 
+            // while preserving their parent field numbers (e.g. "3": {"1":..., "2":...} -> "3": "guid-string")
+            if (!found_guids.empty()) {
+                size_t guid_index = 0;
+                std::regex guid_obj_regex(R"(\{\s*"1"\s*:\s*[^,\}]+\s*,\s*"2"\s*:\s*[^,\}]+\s*\}|\{\s*"2"\s*:\s*[^,\}]+\s*,\s*"1"\s*:[^,\}]+\s*\})");
                 
-                // Simple heuristic replacement of the subfield object block if found in JSON
-                // e.g., {"1":<num>,"2":<num>} or {"2":<num>,"1":<num>}
-                json = std::regex_replace(json, std::regex(R"(\{\s*"1"\s*:\s*[^,\}]+\s*,\s*"2"\s*:\s*[^,\}]+\s*\})"), replacement);
-                json = std::regex_replace(json, std::regex(R"(\{\s*"2"\s*:\s*[^,\}]+\s*,\s*"1"\s*:\s*[^,\}]+\s*\})"), replacement);
+                std::smatch match;
+                std::string search_target = json;
+                std::string patched_json = "";
+
+                while (std::regex_search(search_target, match, guid_obj_regex)) {
+                    patched_json += match.prefix().str();
+                    if (guid_index < found_guids.size()) {
+                        patched_json += "\"" + found_guids[guid_index++] + "\"";
+                    } else {
+                        patched_json += match.str(); // Fallback if counts mismatch
+                    }
+                    search_target = match.suffix().str();
+                }
+                patched_json += search_target;
+                json = patched_json;
             }
 
             sqlite3_result_text(context, json.c_str(), json.length(), SQLITE_TRANSIENT);
@@ -126,6 +133,7 @@ namespace sqlite_protobuf
     int register_protobuf_json(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi)
     {
         int rc;
+
         rc = sqlite3_create_function(db, "protobuf_to_json", -1,
                                      SQLITE_UTF8 | SQLITE_DETERMINISTIC,
                                      nullptr, protobuf_to_json, nullptr, nullptr);
