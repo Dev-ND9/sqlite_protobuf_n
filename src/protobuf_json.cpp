@@ -30,7 +30,7 @@ namespace sqlite_protobuf
             return std::string(buf);
         }
 
-        // Scan raw buffer and extract all Manager.io GUIDs in order of appearance (FIXED OFFSET)
+        // Scan raw buffer and extract all Manager.io GUIDs in order of appearance
         std::vector<std::string> extract_all_manager_guids(const uint8_t *data, size_t size) {
             std::vector<std::string> guids;
             if (size < 18) return guids;
@@ -42,9 +42,11 @@ namespace sqlite_protobuf
                     const uint8_t *p2 = &data[i + 10]; 
                     uint8_t b[16];
 
+                    // Copy first 8 bytes directly (native little-endian memory layout)
                     for (int j = 0; j < 8; ++j) {
-                        b[7 - j] = p1[j];
+                        b[j] = p1[j];
                     }
+                    // Copy last 8 bytes as-is
                     for (int j = 0; j < 8; ++j) {
                         b[8 + j] = p2[j];
                     }
