@@ -91,16 +91,16 @@ namespace sqlite_protobuf
             buffer.end = buffer.start + raw_len;
             Field field = decodeProtobuf(buffer, mode > 1);
 
-            // 3. Generate standard JSON (retaining all original field numbers)
+            // 3. Generate standard JSON
             std::ostringstream os;
             toJson(&field, os, mode > 0);
             std::string json = os.str();
 
             // 4. Sequentially patch the JSON object blocks representing the GUIDs 
-            // while preserving their parent field numbers (e.g. "3": {"1":..., "2":...} -> "3": "guid-string")
             if (!found_guids.empty()) {
                 size_t guid_index = 0;
-                std::regex guid_obj_regex(R"(\{\s*"1"\s*:\s*[^,\}]+\s*,\s*"2"\s*:\s*[^,\}]+\s*\}|\{\s*"2"\s*:\s*[^,\}]+\s*,\s*"1"\s*:[^,\}]+\s*\})");
+                // Precise regex targeting scientific/negative numbers inside field 1 and field 2 objects
+                std::regex guid_obj_regex(R"(\{\s*"1"\s*:\s*-?[0-9.eE+-]+\s*,\s*"2"\s*:\s*-?[0-9.eE+-]+\s*\}|\{\s*"2"\s*:\s*-?[0-9.eE+-]+\s*,\s*"1"\s*:\s*-?[0-9.eE+-]+\s*\})");
                 
                 std::smatch match;
                 std::string search_target = json;
@@ -111,7 +111,7 @@ namespace sqlite_protobuf
                     if (guid_index < found_guids.size()) {
                         patched_json += "\"" + found_guids[guid_index++] + "\"";
                     } else {
-                        patched_json += match.str(); // Fallback if counts mismatch
+                        patched_json += match.str(); 
                     }
                     search_target = match.suffix().str();
                 }
