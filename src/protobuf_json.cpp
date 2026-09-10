@@ -30,15 +30,16 @@ namespace sqlite_protobuf
             return std::string(buf);
         }
 
-        // Scan raw buffer and extract all Manager.io GUIDs in order of appearance
+        // Scan raw buffer and extract all Manager.io GUIDs in order of appearance (FIXED OFFSET)
         std::vector<std::string> extract_all_manager_guids(const uint8_t *data, size_t size) {
             std::vector<std::string> guids;
             if (size < 18) return guids;
 
             for (size_t i = 0; i <= size - 18; ++i) {
-                if (data[i] == 0x09 && data[i + 10] == 0x11) {
+                // Tag 1 (0x09) followed by 8 bytes, then Tag 2 (0x11) at i + 9 followed by 8 bytes
+                if (data[i] == 0x09 && data[i + 9] == 0x11) {
                     const uint8_t *p1 = &data[i + 1];  
-                    const uint8_t *p2 = &data[i + 11]; 
+                    const uint8_t *p2 = &data[i + 10]; 
                     uint8_t b[16];
 
                     for (int j = 0; j < 8; ++j) {
@@ -99,7 +100,6 @@ namespace sqlite_protobuf
             // 4. Sequentially patch the JSON object blocks representing the GUIDs 
             if (!found_guids.empty()) {
                 size_t guid_index = 0;
-                // Precise regex targeting scientific/negative numbers inside field 1 and field 2 objects
                 std::regex guid_obj_regex(R"(\{\s*"1"\s*:\s*-?[0-9.eE+-]+\s*,\s*"2"\s*:\s*-?[0-9.eE+-]+\s*\}|\{\s*"2"\s*:\s*-?[0-9.eE+-]+\s*,\s*"1"\s*:\s*-?[0-9.eE+-]+\s*\})");
                 
                 std::smatch match;
